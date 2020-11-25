@@ -376,6 +376,7 @@ func loadExporters(exps map[string]interface{}, factories map[configmodels.Type]
 
 		// Create the default config for this exporter
 		exporterCfg := factory.CreateDefaultConfig()
+		expandEnvLoadedConfig(exporterCfg)
 		exporterCfg.SetName(fullName)
 
 		// Now that the default config struct is created we can Unmarshal into it
@@ -668,6 +669,35 @@ func expandStringValues(value interface{}) interface{} {
 			nmap[k] = expandStringValues(vint)
 		}
 		return nmap
+	}
+}
+
+// expandEnvLoadedConfig searches
+func expandEnvLoadedConfig(s interface{})  {
+	expandLoadedConfigPointer(s)
+}
+
+func expandLoadedConfigPointer(s interface{}) {
+	value := reflect.ValueOf(s)
+	if value.Kind() != reflect.Ptr {
+		panic("not a pointer")
+	}
+	expandLoadedConfigValue(value.Elem())
+}
+
+func expandLoadedConfigValue(value reflect.Value) {
+	//  This loops through the fields
+	for i := 0; i < value.NumField(); i++ {
+		field := value.Field(i) // returns the content of the field
+		if field.CanSet() {
+			if field.Kind() == reflect.String { // String
+				field.SetString(expandEnv(field.String()))
+			} else if field.Kind() == reflect.Ptr { // Nested pointer to a struct
+				expandLoadedConfigPointer(field.Interface())
+			} else if field.Kind() == reflect.Struct { // Nested struct
+				expandLoadedConfigValue(field)
+			}
+		}
 	}
 }
 
