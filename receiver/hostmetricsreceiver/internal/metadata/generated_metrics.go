@@ -96,9 +96,7 @@ var Metrics = &metricStruct{
 			metric.SetName("system.memory.usage")
 			metric.SetDescription("Bytes of memory in use.")
 			metric.SetUnit("By")
-			metric.SetDataType(pdata.MetricDataTypeIntSum)
-			metric.IntSum().SetIsMonotonic(false)
-			metric.IntSum().SetAggregationTemporality(pdata.AggregationTemporalityDelta)
+			metric.SetDataType(pdata.MetricDataTypeIntGauge)
 			return metric
 		},
 	},

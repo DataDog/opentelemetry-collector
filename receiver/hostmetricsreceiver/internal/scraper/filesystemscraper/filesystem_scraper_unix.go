@@ -34,7 +34,7 @@ func appendSystemSpecificMetrics(metrics pdata.MetricSlice, startIdx int, now pd
 	metric := metrics.At(startIdx)
 	fileSystemINodesUsageDescriptor.CopyTo(metric)
 
-	idps := metric.IntSum().DataPoints()
+	idps := metric.IntGauge().DataPoints()
 	idps.Resize(2 * len(deviceUsages))
 	for idx, deviceUsage := range deviceUsages {
 		startIndex := 2 * idx

@@ -104,7 +104,7 @@ func (s *scraper) Scrape(_ context.Context) (pdata.MetricSlice, error) {
 func initializeFileSystemUsageMetric(metric pdata.Metric, now pdata.TimestampUnixNano, deviceUsages []*deviceUsage) {
 	fileSystemUsageDescriptor.CopyTo(metric)
 
-	idps := metric.IntSum().DataPoints()
+	idps := metric.IntGauge().DataPoints()
 	idps.Resize(fileSystemStatesLen * len(deviceUsages))
 	for i, deviceUsage := range deviceUsages {
 		appendFileSystemUsageStateDataPoints(idps, i*fileSystemStatesLen, now, deviceUsage)

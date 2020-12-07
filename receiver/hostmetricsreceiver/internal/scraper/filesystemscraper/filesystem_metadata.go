@@ -43,10 +43,7 @@ var fileSystemUsageDescriptor = func() pdata.Metric {
 	metric.SetName("system.filesystem.usage")
 	metric.SetDescription("Filesystem bytes used.")
 	metric.SetUnit("bytes")
-	metric.SetDataType(pdata.MetricDataTypeIntSum)
-	sum := metric.IntSum()
-	sum.SetIsMonotonic(false)
-	sum.SetAggregationTemporality(pdata.AggregationTemporalityDelta)
+	metric.SetDataType(pdata.MetricDataTypeIntGauge)
 	return metric
 }()
 
@@ -55,9 +52,6 @@ var fileSystemINodesUsageDescriptor = func() pdata.Metric {
 	metric.SetName("system.filesystem.inodes.usage")
 	metric.SetDescription("FileSystem iNodes used.")
 	metric.SetUnit("1")
-	metric.SetDataType(pdata.MetricDataTypeIntSum)
-	sum := metric.IntSum()
-	sum.SetIsMonotonic(false)
-	sum.SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
+	metric.SetDataType(pdata.MetricDataTypeIntGauge)
 	return metric
 }()
