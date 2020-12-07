@@ -98,7 +98,6 @@ var Metrics = &metricStruct{
 			metric.SetUnit("By")
 			metric.SetDataType(pdata.MetricDataTypeIntSum)
 			metric.IntSum().SetIsMonotonic(false)
-			metric.IntSum().SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
 
 			return metric
 		},
