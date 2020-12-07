@@ -46,6 +46,7 @@ var fileSystemUsageDescriptor = func() pdata.Metric {
 	metric.SetDataType(pdata.MetricDataTypeIntSum)
 	sum := metric.IntSum()
 	sum.SetIsMonotonic(false)
+	sum.SetAggregationTemporality(pdata.AggregationTemporalityDelta)
 	return metric
 }()
 
