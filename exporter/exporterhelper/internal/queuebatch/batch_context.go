@@ -11,14 +11,14 @@ import (
 
 type traceContextKeyType int
 
-const batchSpanLinksKey traceContextKeyType = iota
+const BatchSpanLinksKey traceContextKeyType = iota
 
 // LinksFromContext returns a list of trace links registered in the context.
 func LinksFromContext(ctx context.Context) []trace.Link {
 	if ctx == nil {
 		return []trace.Link{}
 	}
-	if links, ok := ctx.Value(batchSpanLinksKey).([]trace.Link); ok {
+	if links, ok := ctx.Value(BatchSpanLinksKey).([]trace.Link); ok {
 		return links
 	}
 	return []trace.Link{}
@@ -34,7 +34,7 @@ func parentsFromContext(ctx context.Context) []trace.Link {
 func contextWithMergedLinks(ctx1 context.Context, ctx2 context.Context) context.Context {
 	return context.WithValue(
 		context.Background(),
-		batchSpanLinksKey,
+		BatchSpanLinksKey,
 		append(parentsFromContext(ctx1), parentsFromContext(ctx2)...),
 	)
 }

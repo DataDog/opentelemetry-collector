@@ -31,6 +31,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/hosttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/metadatatest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/oteltest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/requesttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sendertest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/storagetest"
@@ -49,10 +50,10 @@ var (
 )
 
 func TestTracesRequest(t *testing.T) {
-	mr := newTracesRequest(testdata.GenerateTraces(1))
+	mr := newTracesRequest(testdata.GenerateTraces(1), nil)
 
 	traceErr := consumererror.NewTraces(errors.New("some error"), ptrace.NewTraces())
-	assert.Equal(t, newTracesRequest(ptrace.NewTraces()), mr.(RequestErrorHandler).OnError(traceErr))
+	assert.Equal(t, newTracesRequest(ptrace.NewTraces(), nil), mr.(RequestErrorHandler).OnError(traceErr))
 }
 
 func TestTraces_InvalidName(t *testing.T) {
@@ -370,6 +371,33 @@ func TestTracesRequest_WithShutdown_ReturnError(t *testing.T) {
 
 	assert.NoError(t, te.Start(context.Background(), componenttest.NewNopHost()))
 	assert.Equal(t, want, te.Shutdown(context.Background()))
+}
+
+func TestTracesRequestWithLinks(t *testing.T) {
+	// Create a trace request with links
+	td := ptrace.NewTraces()
+	link := trace.Link{
+		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			TraceFlags: trace.FlagsSampled,
+		}),
+	}
+	links := []trace.Link{link}
+
+	// Create a context with the links
+	ctx := context.WithValue(context.Background(), queuebatch.BatchSpanLinksKey, links)
+
+	// Use requestFromTraces to create the request
+	converter := requestFromTraces()
+	req, err := converter(ctx, td)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+
+	// Verify the links are preserved
+	tracesReq, ok := req.(*tracesRequest)
+	require.True(t, ok)
+	require.Equal(t, links, tracesReq.links)
 }
 
 func newTraceDataPusher(retError error) consumer.ConsumeTracesFunc {

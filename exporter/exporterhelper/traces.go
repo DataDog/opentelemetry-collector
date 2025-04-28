@@ -5,15 +5,19 @@ package exporterhelper // import "go.opentelemetry.io/collector/exporter/exporte
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"go.uber.org/zap"
+
+	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sizer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -43,42 +47,156 @@ func NewTracesQueueBatchSettings() QueueBatchSettings {
 	}
 }
 
+// TraceStateSerializable represents a serializable version of TraceState
+type TraceStateSerializable struct {
+	Members []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	} `json:"members"`
+}
+
+// traceStateToSerializable converts a TraceState to a serializable format
+func traceStateToSerializable(ts trace.TraceState) TraceStateSerializable {
+	result := TraceStateSerializable{
+		Members: make([]struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}, 0, ts.Len()),
+	}
+
+	ts.Walk(func(key, value string) bool {
+		result.Members = append(result.Members, struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}{
+			Key:   key,
+			Value: value,
+		})
+		return true
+	})
+
+	return result
+}
+
+// serializableToTraceState converts a serializable format back to TraceState
+func serializableToTraceState(ts TraceStateSerializable) (trace.TraceState, error) {
+	var result trace.TraceState
+	var err error
+
+	for _, m := range ts.Members {
+		result, err = result.Insert(m.Key, m.Value)
+		if err != nil {
+			return trace.TraceState{}, err
+		}
+	}
+
+	return result, nil
+}
+
+// Update SerializableLink to use the new TraceState serialization
+type SerializableLink struct {
+	TraceID    [16]byte               `json:"trace_id"`
+	SpanID     [8]byte                `json:"span_id"`
+	TraceFlags byte                   `json:"trace_flags"`
+	TraceState TraceStateSerializable `json:"trace_state"`
+}
+
+func linkToSerializable(l trace.Link) SerializableLink {
+	return SerializableLink{
+		TraceID:    l.SpanContext.TraceID(),
+		SpanID:     l.SpanContext.SpanID(),
+		TraceFlags: byte(l.SpanContext.TraceFlags()),
+		TraceState: traceStateToSerializable(l.SpanContext.TraceState()),
+	}
+}
+
+func serializableToLink(sl SerializableLink) trace.Link {
+	ts, err := serializableToTraceState(sl.TraceState)
+	if err != nil {
+		// If there's an error parsing the trace state, use an empty one
+		ts = trace.TraceState{}
+	}
+
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    sl.TraceID,
+		SpanID:     sl.SpanID,
+		TraceFlags: trace.TraceFlags(sl.TraceFlags),
+		TraceState: ts,
+	})
+	return trace.Link{
+		SpanContext: sc,
+	}
+}
+
 type tracesRequest struct {
 	td         ptrace.Traces
+	links      []trace.Link
 	cachedSize int
 }
 
-func newTracesRequest(td ptrace.Traces) Request {
+func newTracesRequest(td ptrace.Traces, links []trace.Link) Request {
 	return &tracesRequest{
 		td:         td,
+		links:      links,
 		cachedSize: -1,
 	}
 }
 
 type tracesEncoding struct{}
 
+type tracesWithLinks struct {
+	Traces []byte             `json:"traces"`
+	Links  []SerializableLink `json:"links"`
+}
+
 func (tracesEncoding) Unmarshal(bytes []byte) (Request, error) {
-	traces, err := tracesUnmarshaler.UnmarshalTraces(bytes)
+	var twl tracesWithLinks
+	if err := json.Unmarshal(bytes, &twl); err != nil {
+		return nil, err
+	}
+	traces, err := tracesUnmarshaler.UnmarshalTraces(twl.Traces)
 	if err != nil {
 		return nil, err
 	}
-	return newTracesRequest(traces), nil
+	links := make([]trace.Link, len(twl.Links))
+	for i, sl := range twl.Links {
+		links[i] = serializableToLink(sl)
+	}
+	return newTracesRequest(traces, links), nil
 }
 
 func (tracesEncoding) Marshal(req Request) ([]byte, error) {
-	return tracesMarshaler.MarshalTraces(req.(*tracesRequest).td)
+	tr := req.(*tracesRequest)
+	tracesBytes, err := tracesMarshaler.MarshalTraces(tr.td)
+	if err != nil {
+		return nil, err
+	}
+	serializableLinks := make([]SerializableLink, len(tr.links))
+	for i, l := range tr.links {
+		serializableLinks[i] = linkToSerializable(l)
+	}
+	twl := tracesWithLinks{
+		Traces: tracesBytes,
+		Links:  serializableLinks,
+	}
+	return json.Marshal(twl)
 }
 
 func (req *tracesRequest) OnError(err error) Request {
 	var traceError consumererror.Traces
 	if errors.As(err, &traceError) {
-		return newTracesRequest(traceError.Data())
+		return newTracesRequest(traceError.Data(), req.links)
 	}
 	return req
 }
 
 func (req *tracesRequest) ItemsCount() int {
 	return req.td.SpanCount()
+}
+
+// Links returns the trace links associated with this request.
+func (req *tracesRequest) Links() []trace.Link {
+	return req.links
 }
 
 func (req *tracesRequest) size(sizer sizer.TracesSizer) int {
@@ -124,8 +242,9 @@ func requestConsumeFromTraces(pusher consumer.ConsumeTracesFunc) RequestConsumeF
 
 // requestFromTraces returns a RequestConverterFunc that converts ptrace.Traces into a Request.
 func requestFromTraces() RequestConverterFunc[ptrace.Traces] {
-	return func(_ context.Context, traces ptrace.Traces) (Request, error) {
-		return newTracesRequest(traces), nil
+	return func(ctx context.Context, traces ptrace.Traces) (Request, error) {
+		links := queuebatch.LinksFromContext(ctx)
+		return newTracesRequest(traces, links), nil
 	}
 }
 

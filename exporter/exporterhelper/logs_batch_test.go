@@ -234,7 +234,7 @@ func TestMergeSplitLogsBasedOnByteSize(t *testing.T) {
 
 func TestMergeSplitLogsInputNotModifiedIfErrorReturned(t *testing.T) {
 	r1 := newLogsRequest(testdata.GenerateLogs(18))
-	r2 := newTracesRequest(testdata.GenerateTraces(3))
+	r2 := newTracesRequest(testdata.GenerateTraces(3), nil)
 	_, err := r1.MergeSplit(context.Background(), 10, RequestSizerTypeItems, r2)
 	require.Error(t, err)
 	assert.Equal(t, 18, r1.ItemsCount())
