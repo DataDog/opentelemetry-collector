@@ -8,9 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 
-	"go.uber.org/zap"
-
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"

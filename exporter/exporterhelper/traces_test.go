@@ -477,3 +477,40 @@ func checkWrapSpanForTraces(t *testing.T, sr *tracetest.SpanRecorder, tracer tra
 		require.Containsf(t, sd.Attributes(), attribute.KeyValue{Key: internal.ItemsFailed, Value: attribute.Int64Value(failedToSendSpans)}, "SpanData %v", sd)
 	}
 }
+
+func TestSerializableToLink(t *testing.T) {
+	sl := SerializableLink{
+		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: byte(trace.FlagsSampled),
+		TraceState: TraceStateSerializable{
+			Members: []struct {
+				Key   string `json:"key"`
+				Value string `json:"value"`
+			}{
+				{
+					Key:   "@key", // @ is not allowed in trace state keys
+					Value: "value",
+				},
+			},
+		},
+	}
+	res := serializableToLink(sl)
+	// TraceState will be empty due to error in inserting Member Key "@key"
+	assert.Equal(t, trace.TraceState{}, res.SpanContext.TraceState())
+}
+
+func TestTracesEncoding_Unmarshal_InvalidJSON(t *testing.T) {
+	// Create invalid JSON bytes
+	invalidJSON := []byte(`{invalid json}`)
+
+	// Create tracesEncoding instance
+	encoding := tracesEncoding{}
+
+	// Attempt to unmarshal invalid JSON
+	req, err := encoding.Unmarshal(invalidJSON)
+
+	// Verify error is returned and request is nil
+	require.Error(t, err)
+	assert.Nil(t, req)
+}
