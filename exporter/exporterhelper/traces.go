@@ -46,58 +46,32 @@ func NewTracesQueueBatchSettings() QueueBatchSettings {
 	}
 }
 
-// TraceStateSerializable represents a serializable version of TraceState
-type TraceStateSerializable struct {
-	Members []struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	} `json:"members"`
-}
-
-// traceStateToSerializable converts a TraceState to a serializable format
-func traceStateToSerializable(ts trace.TraceState) TraceStateSerializable {
-	result := TraceStateSerializable{
-		Members: make([]struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
-		}, 0, ts.Len()),
-	}
-
-	ts.Walk(func(key, value string) bool {
-		result.Members = append(result.Members, struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
-		}{
-			Key:   key,
-			Value: value,
-		})
-		return true
-	})
-
-	return result
-}
-
-// serializableToTraceState converts a serializable format back to TraceState
-func serializableToTraceState(ts TraceStateSerializable) (trace.TraceState, error) {
-	var result trace.TraceState
-	var err error
-
-	for _, m := range ts.Members {
-		result, err = result.Insert(m.Key, m.Value)
-		if err != nil {
-			return trace.TraceState{}, err
-		}
-	}
-
-	return result, nil
-}
-
-// Update SerializableLink to use the new TraceState serialization
 type SerializableLink struct {
-	TraceID    [16]byte               `json:"trace_id"`
-	SpanID     [8]byte                `json:"span_id"`
-	TraceFlags byte                   `json:"trace_flags"`
-	TraceState TraceStateSerializable `json:"trace_state"`
+	TraceID    [16]byte         `json:"trace_id"`
+	SpanID     [8]byte          `json:"span_id"`
+	TraceFlags byte             `json:"trace_flags"`
+	TraceState trace.TraceState `json:"trace_state"`
+}
+
+func (sl *SerializableLink) UnmarshalJSON(data []byte) error {
+	type Alias SerializableLink // Prevent recursion
+	aux := &struct {
+		TraceState string `json:"trace_state"`
+		*Alias
+	}{
+		Alias: (*Alias)(sl),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.TraceState != "" {
+		ts, err := trace.ParseTraceState(aux.TraceState)
+		if err != nil {
+			return err
+		}
+		sl.TraceState = ts
+	}
+	return nil
 }
 
 func linkToSerializable(l trace.Link) SerializableLink {
@@ -105,22 +79,16 @@ func linkToSerializable(l trace.Link) SerializableLink {
 		TraceID:    l.SpanContext.TraceID(),
 		SpanID:     l.SpanContext.SpanID(),
 		TraceFlags: byte(l.SpanContext.TraceFlags()),
-		TraceState: traceStateToSerializable(l.SpanContext.TraceState()),
+		TraceState: l.SpanContext.TraceState(),
 	}
 }
 
 func serializableToLink(sl SerializableLink) trace.Link {
-	ts, err := serializableToTraceState(sl.TraceState)
-	if err != nil {
-		// If there's an error parsing the trace state, use an empty one
-		ts = trace.TraceState{}
-	}
-
 	sc := trace.NewSpanContext(trace.SpanContextConfig{
 		TraceID:    sl.TraceID,
 		SpanID:     sl.SpanID,
 		TraceFlags: trace.TraceFlags(sl.TraceFlags),
-		TraceState: ts,
+		TraceState: sl.TraceState,
 	})
 	return trace.Link{
 		SpanContext: sc,
@@ -143,13 +111,13 @@ func newTracesRequest(td ptrace.Traces, links []trace.Link) Request {
 
 type tracesEncoding struct{}
 
-type tracesWithLinks struct {
+type tracesWithSpanContexts struct {
 	Traces []byte             `json:"traces"`
 	Links  []SerializableLink `json:"links"`
 }
 
 func (tracesEncoding) Unmarshal(bytes []byte) (Request, error) {
-	var twl tracesWithLinks
+	var twl tracesWithSpanContexts
 	if err := json.Unmarshal(bytes, &twl); err != nil {
 		return nil, err
 	}
@@ -174,7 +142,7 @@ func (tracesEncoding) Marshal(req Request) ([]byte, error) {
 	for i, l := range tr.links {
 		serializableLinks[i] = linkToSerializable(l)
 	}
-	twl := tracesWithLinks{
+	twl := tracesWithSpanContexts{
 		Traces: tracesBytes,
 		Links:  serializableLinks,
 	}

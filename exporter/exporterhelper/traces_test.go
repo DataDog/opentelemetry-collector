@@ -479,25 +479,19 @@ func checkWrapSpanForTraces(t *testing.T, sr *tracetest.SpanRecorder, tracer tra
 }
 
 func TestSerializableToLink(t *testing.T) {
+	ts, err := trace.TraceState{}.Insert("key", "value")
+	if err != nil {
+		t.Fatalf("Error inserting trace state: %v", err)
+	}
 	sl := SerializableLink{
 		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
 		TraceFlags: byte(trace.FlagsSampled),
-		TraceState: TraceStateSerializable{
-			Members: []struct {
-				Key   string `json:"key"`
-				Value string `json:"value"`
-			}{
-				{
-					Key:   "@key", // @ is not allowed in trace state keys
-					Value: "value",
-				},
-			},
-		},
+		TraceState: ts,
 	}
 	res := serializableToLink(sl)
 	// TraceState will be empty due to error in inserting Member Key "@key"
-	assert.Equal(t, trace.TraceState{}, res.SpanContext.TraceState())
+	assert.Equal(t, ts, res.SpanContext.TraceState())
 }
 
 func TestTracesEncoding_Unmarshal_InvalidJSON(t *testing.T) {
