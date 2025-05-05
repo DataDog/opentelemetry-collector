@@ -504,17 +504,119 @@ func TestSerializableToLink(t *testing.T) {
 	assert.Equal(t, sc.TraceState(), scRestored.TraceState())
 }
 
-func TestTracesEncoding_Unmarshal_InvalidJSON(t *testing.T) {
-	// Create invalid JSON bytes
-	invalidJSON := []byte(`{invalid json}`)
-
-	// Create tracesEncoding instance
+func TestTracesEncoding_Unmarshal(t *testing.T) {
 	encoding := tracesEncoding{}
 
-	// Attempt to unmarshal invalid JSON
-	req, err := encoding.Unmarshal(invalidJSON)
+	t.Run("invalid JSON", func(t *testing.T) {
+		invalidJSON := []byte(`{invalid json}`)
+		req, err := encoding.Unmarshal(invalidJSON)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid character 'i' looking for beginning of object key string")
+		assert.Nil(t, req)
+	})
 
-	// Verify error is returned and request is nil
-	require.Error(t, err)
-	assert.Nil(t, req)
+	t.Run("valid JSON, invalid traces", func(t *testing.T) {
+		obj := map[string]any{
+			"traces":       []byte{0x01, 0x02, 0x03},
+			"span_context": []any{},
+		}
+		data, err := json.Marshal(obj)
+		require.NoError(t, err)
+		req, err := encoding.Unmarshal(data)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "proto: TracesData: illegal tag 0 (wire type 1)")
+		assert.Nil(t, req)
+	})
+
+	t.Run("valid JSON and traces, invalid span context", func(t *testing.T) {
+		tracesBytes, err := tracesMarshaler.MarshalTraces(ptrace.NewTraces())
+		require.NoError(t, err)
+		obj := map[string]any{
+			"traces":       tracesBytes,
+			"span_context": []any{map[string]any{"TraceID": 123}},
+		}
+		data, err := json.Marshal(obj)
+		require.NoError(t, err)
+		req, err := encoding.Unmarshal(data)
+		require.Error(t, err)
+		require.IsType(t, &json.UnmarshalTypeError{}, err)
+		assert.Nil(t, req)
+	})
+
+	t.Run("valid JSON, valid traces, valid span context", func(t *testing.T) {
+		traces := ptrace.NewTraces()
+		tracesBytes, err := tracesMarshaler.MarshalTraces(traces)
+		require.NoError(t, err)
+		ts, err := trace.TraceState{}.Insert("key", "value")
+		require.NoError(t, err)
+		sc := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+			TraceFlags: trace.FlagsSampled,
+			TraceState: ts,
+		})
+		spanContexts := []trace.SpanContext{sc}
+		obj := map[string]any{
+			"traces":       tracesBytes,
+			"span_context": spanContexts,
+		}
+		data, err := json.Marshal(obj)
+		require.NoError(t, err)
+		req, err := encoding.Unmarshal(data)
+		require.NoError(t, err)
+		trReq, ok := req.(*tracesRequest)
+		require.True(t, ok)
+		require.Len(t, trReq.links, 1)
+		assert.Equal(t, sc.TraceID(), trReq.links[0].SpanContext.TraceID())
+		assert.Equal(t, sc.SpanID(), trReq.links[0].SpanContext.SpanID())
+		assert.Equal(t, sc.TraceFlags(), trReq.links[0].SpanContext.TraceFlags())
+		assert.Equal(t, sc.TraceState(), trReq.links[0].SpanContext.TraceState())
+	})
+}
+
+func TestUnmarshalSpanContextConfig_Errors(t *testing.T) {
+	cases := []struct {
+		name    string
+		json    string
+		wantErr string
+	}{
+		{
+			name:    "invalid json",
+			json:    `{"TraceID": 123`,
+			wantErr: "unexpected end of JSON input",
+		},
+		{
+			name:    "invalid trace id",
+			json:    `{"TraceID": "zzzz", "SpanID": "0102030405060708", "TraceFlags": "01", "TraceState": "", "Remote": false}`,
+			wantErr: "hex encoded trace-id must have length equals to 32",
+		},
+		{
+			name:    "invalid span id",
+			json:    `{"TraceID": "0102030405060708090a0b0c0d0e0f10", "SpanID": "zzzz", "TraceFlags": "01", "TraceState": "", "Remote": false}`,
+			wantErr: "hex encoded span-id must have length equals to 16",
+		},
+		{
+			name:    "invalid trace state",
+			json:    `{"TraceID": "0102030405060708090a0b0c0d0e0f10", "SpanID": "0102030405060708", "TraceFlags": "01", "TraceState": "bad=bad=bad", "Remote": false}`,
+			wantErr: "failed to parse tracestate",
+		},
+		{
+			name:    "invalid trace flags (not hex)",
+			json:    `{"TraceID": "0102030405060708090a0b0c0d0e0f10", "SpanID": "0102030405060708", "TraceFlags": "zz", "TraceState": "", "Remote": false}`,
+			wantErr: "invalid byte",
+		},
+		{
+			name:    "invalid trace flags (wrong length)",
+			json:    `{"TraceID": "0102030405060708090a0b0c0d0e0f10", "SpanID": "0102030405060708", "TraceFlags": "0102", "TraceState": "", "Remote": false}`,
+			wantErr: "invalid trace flags",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := unmarshalSpanContextConfig([]byte(tc.json))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
 }
