@@ -5,6 +5,7 @@ package exporterhelper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -480,18 +481,27 @@ func checkWrapSpanForTraces(t *testing.T, sr *tracetest.SpanRecorder, tracer tra
 
 func TestSerializableToLink(t *testing.T) {
 	ts, err := trace.TraceState{}.Insert("key", "value")
-	if err != nil {
-		t.Fatalf("Error inserting trace state: %v", err)
-	}
-	sl := SerializableLink{
+	require.NoError(t, err)
+
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
 		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
-		TraceFlags: byte(trace.FlagsSampled),
+		TraceFlags: trace.FlagsSampled,
 		TraceState: ts,
-	}
-	res := serializableToLink(sl)
-	// TraceState will be empty due to error in inserting Member Key "@key"
-	assert.Equal(t, ts, res.SpanContext.TraceState())
+	})
+
+	// Marshal and unmarshal SpanContext as JSON
+	data, err := json.Marshal(sc)
+	require.NoError(t, err)
+
+	sc2, err := unmarshalSpanContextConfig(data)
+	require.NoError(t, err)
+	scRestored := trace.NewSpanContext(sc2)
+
+	assert.Equal(t, sc.TraceID(), scRestored.TraceID())
+	assert.Equal(t, sc.SpanID(), scRestored.SpanID())
+	assert.Equal(t, sc.TraceFlags(), scRestored.TraceFlags())
+	assert.Equal(t, sc.TraceState(), scRestored.TraceState())
 }
 
 func TestTracesEncoding_Unmarshal_InvalidJSON(t *testing.T) {

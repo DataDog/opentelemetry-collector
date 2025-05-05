@@ -5,6 +5,7 @@ package exporterhelper // import "go.opentelemetry.io/collector/exporter/exporte
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 
@@ -46,55 +47,6 @@ func NewTracesQueueBatchSettings() QueueBatchSettings {
 	}
 }
 
-type SerializableLink struct {
-	TraceID    [16]byte         `json:"trace_id"`
-	SpanID     [8]byte          `json:"span_id"`
-	TraceFlags byte             `json:"trace_flags"`
-	TraceState trace.TraceState `json:"trace_state"`
-}
-
-func (sl *SerializableLink) UnmarshalJSON(data []byte) error {
-	type Alias SerializableLink // Prevent recursion
-	aux := &struct {
-		TraceState string `json:"trace_state"`
-		*Alias
-	}{
-		Alias: (*Alias)(sl),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-	if aux.TraceState != "" {
-		ts, err := trace.ParseTraceState(aux.TraceState)
-		if err != nil {
-			return err
-		}
-		sl.TraceState = ts
-	}
-	return nil
-}
-
-func linkToSerializable(l trace.Link) SerializableLink {
-	return SerializableLink{
-		TraceID:    l.SpanContext.TraceID(),
-		SpanID:     l.SpanContext.SpanID(),
-		TraceFlags: byte(l.SpanContext.TraceFlags()),
-		TraceState: l.SpanContext.TraceState(),
-	}
-}
-
-func serializableToLink(sl SerializableLink) trace.Link {
-	sc := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    sl.TraceID,
-		SpanID:     sl.SpanID,
-		TraceFlags: trace.TraceFlags(sl.TraceFlags),
-		TraceState: sl.TraceState,
-	})
-	return trace.Link{
-		SpanContext: sc,
-	}
-}
-
 type tracesRequest struct {
 	td         ptrace.Traces
 	links      []trace.Link
@@ -112,12 +64,58 @@ func newTracesRequest(td ptrace.Traces, links []trace.Link) Request {
 type tracesEncoding struct{}
 
 type tracesWithSpanContexts struct {
-	Traces []byte             `json:"traces"`
-	Links  []SerializableLink `json:"links"`
+	Traces      []byte              `json:"traces"`
+	SpanContext []trace.SpanContext `json:"span_context"`
+}
+
+// Helper for JSON unmarshaling of SpanContextConfig
+
+type spanContextConfigJSON struct {
+	TraceID    string
+	SpanID     string
+	TraceFlags string
+	TraceState string
+	Remote     bool
+}
+
+func unmarshalSpanContextConfig(data []byte) (trace.SpanContextConfig, error) {
+	var aux spanContextConfigJSON
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return trace.SpanContextConfig{}, err
+	}
+	tid, err := trace.TraceIDFromHex(aux.TraceID)
+	if err != nil {
+		return trace.SpanContextConfig{}, err
+	}
+	sid, err := trace.SpanIDFromHex(aux.SpanID)
+	if err != nil {
+		return trace.SpanContextConfig{}, err
+	}
+	ts, err := trace.ParseTraceState(aux.TraceState)
+	if err != nil {
+		return trace.SpanContextConfig{}, err
+	}
+	tf, err := hex.DecodeString(aux.TraceFlags)
+	if err != nil {
+		return trace.SpanContextConfig{}, err
+	}
+	if len(tf) != 1 {
+		return trace.SpanContextConfig{}, errors.New("invalid trace flags")
+	}
+	return trace.SpanContextConfig{
+		TraceID:    tid,
+		SpanID:     sid,
+		TraceFlags: trace.TraceFlags(tf[0]),
+		TraceState: ts,
+		Remote:     aux.Remote,
+	}, nil
 }
 
 func (tracesEncoding) Unmarshal(bytes []byte) (Request, error) {
-	var twl tracesWithSpanContexts
+	var twl struct {
+		Traces      []byte            `json:"traces"`
+		SpanContext []json.RawMessage `json:"span_context"`
+	}
 	if err := json.Unmarshal(bytes, &twl); err != nil {
 		return nil, err
 	}
@@ -125,9 +123,13 @@ func (tracesEncoding) Unmarshal(bytes []byte) (Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	links := make([]trace.Link, len(twl.Links))
-	for i, sl := range twl.Links {
-		links[i] = serializableToLink(sl)
+	links := make([]trace.Link, len(twl.SpanContext))
+	for i, raw := range twl.SpanContext {
+		cfg, err := unmarshalSpanContextConfig(raw)
+		if err != nil {
+			return nil, err
+		}
+		links[i] = trace.Link{SpanContext: trace.NewSpanContext(cfg)}
 	}
 	return newTracesRequest(traces, links), nil
 }
@@ -138,13 +140,13 @@ func (tracesEncoding) Marshal(req Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	serializableLinks := make([]SerializableLink, len(tr.links))
+	spanContexts := make([]trace.SpanContext, len(tr.links))
 	for i, l := range tr.links {
-		serializableLinks[i] = linkToSerializable(l)
+		spanContexts[i] = l.SpanContext
 	}
 	twl := tracesWithSpanContexts{
-		Traces: tracesBytes,
-		Links:  serializableLinks,
+		Traces:      tracesBytes,
+		SpanContext: spanContexts,
 	}
 	return json.Marshal(twl)
 }
