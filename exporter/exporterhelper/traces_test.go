@@ -32,7 +32,6 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/hosttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/metadatatest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/oteltest"
-	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/requesttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sendertest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/storagetest"
@@ -374,31 +373,30 @@ func TestTracesRequest_WithShutdown_ReturnError(t *testing.T) {
 	assert.Equal(t, want, te.Shutdown(context.Background()))
 }
 
-func TestTracesRequestWithLinks(t *testing.T) {
-	// Create a trace request with links
+func TestTracesRequestWithSpanContexts(t *testing.T) {
+	// Create a trace request with spancontexts
 	td := ptrace.NewTraces()
-	link := trace.Link{
-		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-			SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
-			TraceFlags: trace.FlagsSampled,
-		}),
-	}
-	links := []trace.Link{link}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: trace.FlagsSampled,
+	})
+	spancontexts := []trace.SpanContext{sc}
 
-	// Create a context with the links
-	ctx := context.WithValue(context.Background(), queuebatch.BatchSpanLinksKey, links)
+	// Create a context with the spancontexts
+	ctx := context.Background()
+	ctxWithSpanContext := trace.ContextWithSpanContext(ctx, sc)
 
 	// Use requestFromTraces to create the request
 	converter := requestFromTraces()
-	req, err := converter(ctx, td)
+	req, err := converter(ctxWithSpanContext, td)
 	require.NoError(t, err)
 	require.NotNil(t, req)
 
-	// Verify the links are preserved
+	// Verify the spancontexts are preserved
 	tracesReq, ok := req.(*tracesRequest)
 	require.True(t, ok)
-	require.Equal(t, links, tracesReq.links)
+	require.ElementsMatch(t, spancontexts, tracesReq.spancontexts)
 }
 
 func newTraceDataPusher(retError error) consumer.ConsumeTracesFunc {
@@ -479,7 +477,7 @@ func checkWrapSpanForTraces(t *testing.T, sr *tracetest.SpanRecorder, tracer tra
 	}
 }
 
-func TestSerializableToLink(t *testing.T) {
+func TestSerializableToSpanContext(t *testing.T) {
 	ts, err := trace.TraceState{}.Insert("key", "value")
 	require.NoError(t, err)
 
@@ -517,8 +515,8 @@ func TestTracesEncoding_Unmarshal(t *testing.T) {
 
 	t.Run("valid JSON, invalid traces", func(t *testing.T) {
 		obj := map[string]any{
-			"traces":       []byte{0x01, 0x02, 0x03},
-			"span_context": []any{},
+			"traces":        []byte{0x01, 0x02, 0x03},
+			"span_contexts": []any{},
 		}
 		data, err := json.Marshal(obj)
 		require.NoError(t, err)
@@ -532,8 +530,8 @@ func TestTracesEncoding_Unmarshal(t *testing.T) {
 		tracesBytes, err := tracesMarshaler.MarshalTraces(ptrace.NewTraces())
 		require.NoError(t, err)
 		obj := map[string]any{
-			"traces":       tracesBytes,
-			"span_context": []any{map[string]any{"TraceID": 123}},
+			"traces":        tracesBytes,
+			"span_contexts": []any{map[string]any{"TraceID": 123}},
 		}
 		data, err := json.Marshal(obj)
 		require.NoError(t, err)
@@ -557,8 +555,8 @@ func TestTracesEncoding_Unmarshal(t *testing.T) {
 		})
 		spanContexts := []trace.SpanContext{sc}
 		obj := map[string]any{
-			"traces":       tracesBytes,
-			"span_context": spanContexts,
+			"traces":        tracesBytes,
+			"span_contexts": spanContexts,
 		}
 		data, err := json.Marshal(obj)
 		require.NoError(t, err)
@@ -566,11 +564,11 @@ func TestTracesEncoding_Unmarshal(t *testing.T) {
 		require.NoError(t, err)
 		trReq, ok := req.(*tracesRequest)
 		require.True(t, ok)
-		require.Len(t, trReq.links, 1)
-		assert.Equal(t, sc.TraceID(), trReq.links[0].SpanContext.TraceID())
-		assert.Equal(t, sc.SpanID(), trReq.links[0].SpanContext.SpanID())
-		assert.Equal(t, sc.TraceFlags(), trReq.links[0].SpanContext.TraceFlags())
-		assert.Equal(t, sc.TraceState(), trReq.links[0].SpanContext.TraceState())
+		require.Len(t, trReq.spancontexts, 1)
+		assert.Equal(t, sc.TraceID(), trReq.spancontexts[0].TraceID())
+		assert.Equal(t, sc.SpanID(), trReq.spancontexts[0].SpanID())
+		assert.Equal(t, sc.TraceFlags(), trReq.spancontexts[0].TraceFlags())
+		assert.Equal(t, sc.TraceState(), trReq.spancontexts[0].TraceState())
 	})
 }
 

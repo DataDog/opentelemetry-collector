@@ -17,7 +17,6 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal"
-	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sizer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -48,16 +47,16 @@ func NewTracesQueueBatchSettings() QueueBatchSettings {
 }
 
 type tracesRequest struct {
-	td         ptrace.Traces
-	links      []trace.Link
-	cachedSize int
+	td           ptrace.Traces
+	spancontexts []trace.SpanContext
+	cachedSize   int
 }
 
-func newTracesRequest(td ptrace.Traces, links []trace.Link) Request {
+func newTracesRequest(td ptrace.Traces, spancontexts []trace.SpanContext) Request {
 	return &tracesRequest{
-		td:         td,
-		links:      links,
-		cachedSize: -1,
+		td:           td,
+		spancontexts: spancontexts,
+		cachedSize:   -1,
 	}
 }
 
@@ -65,7 +64,7 @@ type tracesEncoding struct{}
 
 type tracesWithSpanContexts struct {
 	Traces      []byte              `json:"traces"`
-	SpanContext []trace.SpanContext `json:"span_context"`
+	SpanContext []trace.SpanContext `json:"span_contexts"`
 }
 
 // Helper for JSON unmarshaling of SpanContextConfig
@@ -112,26 +111,26 @@ func unmarshalSpanContextConfig(data []byte) (trace.SpanContextConfig, error) {
 }
 
 func (tracesEncoding) Unmarshal(bytes []byte) (Request, error) {
-	var twl struct {
-		Traces      []byte            `json:"traces"`
-		SpanContext []json.RawMessage `json:"span_context"`
+	var tracesWithSpanContextsRaw struct {
+		Traces          []byte            `json:"traces"`
+		SpanContextsRaw []json.RawMessage `json:"span_contexts"`
 	}
-	if err := json.Unmarshal(bytes, &twl); err != nil {
+	if err := json.Unmarshal(bytes, &tracesWithSpanContextsRaw); err != nil {
 		return nil, err
 	}
-	traces, err := tracesUnmarshaler.UnmarshalTraces(twl.Traces)
+	traces, err := tracesUnmarshaler.UnmarshalTraces(tracesWithSpanContextsRaw.Traces)
 	if err != nil {
 		return nil, err
 	}
-	links := make([]trace.Link, len(twl.SpanContext))
-	for i, raw := range twl.SpanContext {
+	spancontexts := make([]trace.SpanContext, len(tracesWithSpanContextsRaw.SpanContextsRaw))
+	for i, raw := range tracesWithSpanContextsRaw.SpanContextsRaw {
 		cfg, err := unmarshalSpanContextConfig(raw)
 		if err != nil {
 			return nil, err
 		}
-		links[i] = trace.Link{SpanContext: trace.NewSpanContext(cfg)}
+		spancontexts[i] = trace.NewSpanContext(cfg)
 	}
-	return newTracesRequest(traces, links), nil
+	return newTracesRequest(traces, spancontexts), nil
 }
 
 func (tracesEncoding) Marshal(req Request) ([]byte, error) {
@@ -140,13 +139,9 @@ func (tracesEncoding) Marshal(req Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	spanContexts := make([]trace.SpanContext, len(tr.links))
-	for i, l := range tr.links {
-		spanContexts[i] = l.SpanContext
-	}
 	twl := tracesWithSpanContexts{
 		Traces:      tracesBytes,
-		SpanContext: spanContexts,
+		SpanContext: tr.spancontexts,
 	}
 	return json.Marshal(twl)
 }
@@ -154,7 +149,7 @@ func (tracesEncoding) Marshal(req Request) ([]byte, error) {
 func (req *tracesRequest) OnError(err error) Request {
 	var traceError consumererror.Traces
 	if errors.As(err, &traceError) {
-		return newTracesRequest(traceError.Data(), req.links)
+		return newTracesRequest(traceError.Data(), req.spancontexts)
 	}
 	return req
 }
@@ -163,9 +158,9 @@ func (req *tracesRequest) ItemsCount() int {
 	return req.td.SpanCount()
 }
 
-// Links returns the trace links associated with this request.
-func (req *tracesRequest) Links() []trace.Link {
-	return req.links
+// SpanContexts returns the SpanContexts associated with this request.
+func (req *tracesRequest) SpanContexts() []trace.SpanContext {
+	return req.spancontexts
 }
 
 func (req *tracesRequest) size(sizer sizer.TracesSizer) int {
@@ -212,8 +207,11 @@ func requestConsumeFromTraces(pusher consumer.ConsumeTracesFunc) RequestConsumeF
 // requestFromTraces returns a RequestConverterFunc that converts ptrace.Traces into a Request.
 func requestFromTraces() RequestConverterFunc[ptrace.Traces] {
 	return func(ctx context.Context, traces ptrace.Traces) (Request, error) {
-		links := queuebatch.LinksFromContext(ctx)
-		return newTracesRequest(traces, links), nil
+		spancontext := trace.SpanContextFromContext(ctx)
+		// if !spancontext.IsValid() {
+		// 	spancontext = trace.
+		// }
+		return newTracesRequest(traces, []trace.SpanContext{spancontext}), nil
 	}
 }
 

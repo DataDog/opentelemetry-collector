@@ -45,8 +45,8 @@ func (req *tracesRequest) mergeTo(dst *tracesRequest, sz sizer.TracesSizer) {
 		req.setCachedSize(0)
 	}
 	req.td.ResourceSpans().MoveAndAppendTo(dst.td.ResourceSpans())
-	// Merge the links from both requests
-	dst.links = append(dst.links, req.links...)
+	// Merge the spancontexts from both requests
+	dst.spancontexts = append(dst.spancontexts, req.spancontexts...)
 }
 
 func (req *tracesRequest) split(maxSize int, sz sizer.TracesSizer) []Request {
@@ -54,7 +54,7 @@ func (req *tracesRequest) split(maxSize int, sz sizer.TracesSizer) []Request {
 	for req.size(sz) > maxSize {
 		td, rmSize := extractTraces(req.td, maxSize, sz)
 		req.setCachedSize(req.size(sz) - rmSize)
-		res = append(res, newTracesRequest(td, req.Links()))
+		res = append(res, newTracesRequest(td, req.SpanContexts()))
 	}
 	res = append(res, req)
 	return res

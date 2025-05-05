@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sizer"
@@ -338,28 +337,18 @@ func BenchmarkSplittingBasedOnItemCountHugeTraces(b *testing.B) {
 	}
 }
 
-func TestMergeSplitTracesWithLinks(t *testing.T) {
-	// Create test links
-	link1 := trace.Link{
-		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-			SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
-			TraceFlags: trace.FlagsSampled,
-		}),
-		Attributes: []attribute.KeyValue{
-			attribute.String("key1", "value1"),
-		},
-	}
-	link2 := trace.Link{
-		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-			SpanID:     [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
-			TraceFlags: trace.FlagsSampled,
-		}),
-		Attributes: []attribute.KeyValue{
-			attribute.String("key2", "value2"),
-		},
-	}
+func TestMergeSplitTracesWithSpanContexts(t *testing.T) {
+	// Create test spancontexts
+	sc1 := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: trace.FlagsSampled,
+	})
+	sc2 := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+		SpanID:     [8]byte{8, 7, 6, 5, 4, 3, 2, 1},
+		TraceFlags: trace.FlagsSampled,
+	})
 
 	tests := []struct {
 		name     string
@@ -370,38 +359,38 @@ func TestMergeSplitTracesWithLinks(t *testing.T) {
 		expected []Request
 	}{
 		{
-			name:    "merge_with_links",
+			name:    "merge_with_span_contexts",
 			szt:     RequestSizerTypeItems,
 			maxSize: 10,
-			tr1:     newTracesRequest(testdata.GenerateTraces(2), []trace.Link{link1}),
-			tr2:     newTracesRequest(testdata.GenerateTraces(3), []trace.Link{link2}),
+			tr1:     newTracesRequest(testdata.GenerateTraces(2), []trace.SpanContext{sc1}),
+			tr2:     newTracesRequest(testdata.GenerateTraces(3), []trace.SpanContext{sc2}),
 			expected: []Request{newTracesRequest(func() ptrace.Traces {
 				td := testdata.GenerateTraces(2)
 				testdata.GenerateTraces(3).ResourceSpans().MoveAndAppendTo(td.ResourceSpans())
 				return td
-			}(), []trace.Link{link1, link2})},
+			}(), []trace.SpanContext{sc1, sc2})},
 		},
 		{
-			name:    "split_with_links",
+			name:    "split_with_span_contexts",
 			szt:     RequestSizerTypeItems,
 			maxSize: 2,
-			tr1:     newTracesRequest(testdata.GenerateTraces(5), []trace.Link{link1, link2}),
+			tr1:     newTracesRequest(testdata.GenerateTraces(5), []trace.SpanContext{sc1, sc2}),
 			tr2:     nil,
 			expected: []Request{
-				newTracesRequest(testdata.GenerateTraces(2), []trace.Link{link1, link2}),
-				newTracesRequest(testdata.GenerateTraces(2), []trace.Link{link1, link2}),
-				newTracesRequest(testdata.GenerateTraces(1), []trace.Link{link1, link2}),
+				newTracesRequest(testdata.GenerateTraces(2), []trace.SpanContext{sc1, sc2}),
+				newTracesRequest(testdata.GenerateTraces(2), []trace.SpanContext{sc1, sc2}),
+				newTracesRequest(testdata.GenerateTraces(1), []trace.SpanContext{sc1, sc2}),
 			},
 		},
 		{
-			name:    "merge_and_split_with_links",
+			name:    "merge_and_split_with_span_contexts",
 			szt:     RequestSizerTypeItems,
 			maxSize: 3,
-			tr1:     newTracesRequest(testdata.GenerateTraces(2), []trace.Link{link1}),
-			tr2:     newTracesRequest(testdata.GenerateTraces(4), []trace.Link{link2}),
+			tr1:     newTracesRequest(testdata.GenerateTraces(2), []trace.SpanContext{sc1}),
+			tr2:     newTracesRequest(testdata.GenerateTraces(4), []trace.SpanContext{sc2}),
 			expected: []Request{
-				newTracesRequest(testdata.GenerateTraces(3), []trace.Link{link1, link2}),
-				newTracesRequest(testdata.GenerateTraces(3), []trace.Link{link1, link2}),
+				newTracesRequest(testdata.GenerateTraces(3), []trace.SpanContext{sc1, sc2}),
+				newTracesRequest(testdata.GenerateTraces(3), []trace.SpanContext{sc1, sc2}),
 			},
 		},
 	}
@@ -414,27 +403,25 @@ func TestMergeSplitTracesWithLinks(t *testing.T) {
 			for i := range res {
 				tracesReq := res[i].(*tracesRequest)
 				expectedReq := tt.expected[i].(*tracesRequest)
-				assert.Len(t, tracesReq.links, len(expectedReq.links))
-				assert.Equal(t, expectedReq.links, tracesReq.links)
+				assert.Len(t, tracesReq.spancontexts, len(expectedReq.spancontexts))
+				assert.Equal(t, expectedReq.spancontexts, tracesReq.spancontexts)
 			}
 		})
 	}
 }
 
-func TestTracesRequestLinksMarshaling(t *testing.T) {
+func TestTracesRequestSpanContextsMarshaling(t *testing.T) {
 	traceState, err := trace.TraceState{}.Insert("key1", "value1")
 	require.NoError(t, err)
 
-	link := trace.Link{
-		SpanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
-			SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
-			TraceFlags: trace.FlagsSampled,
-			TraceState: traceState,
-		}),
-	}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: trace.FlagsSampled,
+		TraceState: traceState,
+	})
 
-	originalReq := newTracesRequest(testdata.GenerateTraces(2), []trace.Link{link})
+	originalReq := newTracesRequest(testdata.GenerateTraces(2), []trace.SpanContext{sc})
 
 	// Marshal the request
 	encoding := tracesEncoding{}
@@ -447,14 +434,14 @@ func TestTracesRequestLinksMarshaling(t *testing.T) {
 
 	// Verify the unmarshaled request
 	tracesReq := newReq.(*tracesRequest)
-	require.Len(t, tracesReq.links, 1)
+	require.Len(t, tracesReq.spancontexts, 1)
 
-	// Verify link properties
-	unmarshaledLink := tracesReq.links[0]
-	assert.Equal(t, link.SpanContext.TraceID(), unmarshaledLink.SpanContext.TraceID())
-	assert.Equal(t, link.SpanContext.SpanID(), unmarshaledLink.SpanContext.SpanID())
-	assert.Equal(t, link.SpanContext.TraceFlags(), unmarshaledLink.SpanContext.TraceFlags())
-	assert.Equal(t, link.SpanContext.TraceState(), unmarshaledLink.SpanContext.TraceState())
+	// Verify spancontext properties
+	unmarshaledSpanContext := tracesReq.spancontexts[0]
+	assert.Equal(t, sc.TraceID(), unmarshaledSpanContext.TraceID())
+	assert.Equal(t, sc.SpanID(), unmarshaledSpanContext.SpanID())
+	assert.Equal(t, sc.TraceFlags(), unmarshaledSpanContext.TraceFlags())
+	assert.Equal(t, sc.TraceState(), unmarshaledSpanContext.TraceState())
 
 	// Verify trace data
 	assert.Equal(t, originalReq.(*tracesRequest).td, tracesReq.td)
