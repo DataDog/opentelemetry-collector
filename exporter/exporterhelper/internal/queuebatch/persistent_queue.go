@@ -256,7 +256,7 @@ type spanContextConfigWrapper struct {
 	Remote     bool
 }
 
-func SpanContextFromWrapper(wrapper spanContextConfigWrapper) (*trace.SpanContext, error) {
+func spanContextFromWrapper(wrapper spanContextConfigWrapper) (*trace.SpanContext, error) {
 	traceID, err := trace.TraceIDFromHex(wrapper.TraceID)
 	if err != nil {
 		return nil, err
@@ -286,10 +286,6 @@ func SpanContextFromWrapper(wrapper spanContextConfigWrapper) (*trace.SpanContex
 		Remote:     wrapper.Remote,
 	})
 
-	if !sc.IsValid() {
-		return nil, nil
-	}
-
 	return &sc, nil
 }
 
@@ -309,7 +305,7 @@ func unmarshalRequestWithSpanContext[T any](encoding Encoding[T], value []byte) 
 	if len(envelope.SpanContextJSON) > 0 {
 		var wrapper spanContextConfigWrapper
 		if err := json.Unmarshal(envelope.SpanContextJSON, &wrapper); err == nil {
-			if sc, err := SpanContextFromWrapper(wrapper); err == nil && sc != nil {
+			if sc, err := spanContextFromWrapper(wrapper); err == nil && sc != nil {
 				restoredContext = trace.ContextWithSpanContext(restoredContext, *sc)
 			}
 		}
