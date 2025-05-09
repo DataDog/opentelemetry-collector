@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	contribstoragetest "github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/storagetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -28,6 +30,8 @@ import (
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/extension/extensiontest"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pipeline"
 )
 
@@ -913,7 +917,7 @@ func TestPersistentQueue_ShutdownWhileConsuming(t *testing.T) {
 }
 
 func TestPersistentQueue_StorageFull(t *testing.T) {
-	marshaled, err := uint64Encoding{}.Marshal(uint64(50))
+	marshaled, err := marshalRequestWithSpanContext(context.Background(), uint64Encoding{}, uint64(50))
 	require.NoError(t, err)
 	maxSizeInBytes := len(marshaled) * 5 // arbitrary small number
 
@@ -1204,4 +1208,374 @@ func requireCurrentlyDispatchedItemsEqual(t *testing.T, pq *persistentQueue[uint
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	assert.ElementsMatch(t, compare, pq.currentlyDispatchedItems)
+}
+
+func TestSpanContextFromWrapper(t *testing.T) {
+	testCases := []struct {
+		name          string
+		wrapper       spanContextConfigWrapper
+		expectErr     bool
+		errContains   string
+		expectNil     bool
+		expectValid   bool
+		expectTraceID string
+		expectSpanID  string
+		expectFlags   string
+		expectState   string
+		expectRemote  bool
+	}{
+		{
+			name: "invalid trace id",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "invalidtraceid",
+				SpanID:     "0102030405060708",
+				TraceFlags: "01",
+				TraceState: "",
+				Remote:     false,
+			},
+			expectErr: true,
+			expectNil: true,
+		},
+		{
+			name: "invalid span id",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "0102030405060708090a0b0c0d0e0f10",
+				SpanID:     "invalidspanid",
+				TraceFlags: "01",
+				TraceState: "",
+				Remote:     false,
+			},
+			expectErr: true,
+			expectNil: true,
+		},
+		{
+			name: "invalid trace flags hex",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "0102030405060708090a0b0c0d0e0f10",
+				SpanID:     "0102030405060708",
+				TraceFlags: "zz",
+				TraceState: "",
+				Remote:     false,
+			},
+			expectErr: true,
+			expectNil: true,
+		},
+		{
+			name: "invalid trace flags length",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "0102030405060708090a0b0c0d0e0f10",
+				SpanID:     "0102030405060708",
+				TraceFlags: "0102",
+				TraceState: "",
+				Remote:     false,
+			},
+			expectErr:   true,
+			expectNil:   true,
+			errContains: errInvalidTraceFlagsLength,
+		},
+		{
+			name: "invalid trace state",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "0102030405060708090a0b0c0d0e0f10",
+				SpanID:     "0102030405060708",
+				TraceFlags: "01",
+				TraceState: "invalid=tracestate,=bad",
+				Remote:     false,
+			},
+			expectErr: true,
+			expectNil: true,
+		},
+		{
+			name: "valid span context",
+			wrapper: spanContextConfigWrapper{
+				TraceID:    "0102030405060708090a0b0c0d0e0f10",
+				SpanID:     "0102030405060708",
+				TraceFlags: "01",
+				TraceState: "vendor=value",
+				Remote:     true,
+			},
+			expectErr:     false,
+			expectNil:     false,
+			expectValid:   true,
+			expectTraceID: "0102030405060708090a0b0c0d0e0f10",
+			expectSpanID:  "0102030405060708",
+			expectFlags:   "01",
+			expectState:   "vendor=value",
+			expectRemote:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			scc, err := spanContextFromWrapper(tc.wrapper)
+			if tc.expectErr {
+				require.Error(t, err)
+				if tc.errContains != "" {
+					assert.Contains(t, err.Error(), tc.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.expectNil {
+				assert.Nil(t, scc)
+			} else {
+				assert.NotNil(t, scc)
+				if tc.expectValid {
+					sccObject := trace.SpanContext(*scc)
+					assert.True(t, sccObject.IsValid())
+					assert.Equal(t, tc.expectTraceID, sccObject.TraceID().String())
+					assert.Equal(t, tc.expectSpanID, sccObject.SpanID().String())
+					assert.Equal(t, tc.expectFlags, sccObject.TraceFlags().String())
+					assert.Equal(t, tc.expectState, sccObject.TraceState().String())
+					assert.Equal(t, tc.expectRemote, sccObject.IsRemote())
+				}
+			}
+		})
+	}
+}
+
+func TestPersistentQueue_SpanContextRoundTrip(t *testing.T) {
+	// Setup a minimal persistent queue using uint64Encoding and uint64
+	pq := newPersistentQueue[uint64](persistentQueueSettings[uint64]{
+		sizer:     request.RequestsSizer[uint64]{},
+		capacity:  10,
+		signal:    pipeline.SignalTraces,
+		storageID: component.ID{},
+		encoding:  uint64Encoding{},
+		id:        component.NewID(exportertest.NopType),
+		telemetry: componenttest.NewNopTelemetrySettings(),
+	}).(*persistentQueue[uint64])
+
+	ext := storagetest.NewMockStorageExtension(nil)
+	client, err := ext.GetClient(context.Background(), component.KindExporter, pq.set.id, pq.set.signal.String())
+	require.NoError(t, err)
+	pq.initClient(context.Background(), client)
+
+	// Create a valid SpanContext
+	traceID, _ := trace.TraceIDFromHex("0102030405060708090a0b0c0d0e0f10")
+	spanID, _ := trace.SpanIDFromHex("0102030405060708")
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: 0x01,
+		TraceState: trace.TraceState{},
+		Remote:     true,
+	})
+	ctxWithSC := trace.ContextWithSpanContext(context.Background(), sc)
+
+	// Offer a request with this context
+	req := uint64(42)
+	require.NoError(t, pq.Offer(ctxWithSC, req))
+
+	// Read the request and restored context
+	restoredCtx, gotReq, _, ok := pq.Read(context.Background())
+	require.True(t, ok)
+	assert.Equal(t, req, gotReq)
+	restoredSC := trace.SpanContextFromContext(restoredCtx)
+	assert.True(t, restoredSC.IsValid())
+	assert.Equal(t, sc.TraceID(), restoredSC.TraceID())
+	assert.Equal(t, sc.SpanID(), restoredSC.SpanID())
+	assert.Equal(t, sc.TraceFlags(), restoredSC.TraceFlags())
+	assert.Equal(t, sc.TraceState().String(), restoredSC.TraceState().String())
+	assert.Equal(t, sc.IsRemote(), restoredSC.IsRemote())
+
+	// Also test with a context with no SpanContext
+	req2 := uint64(99)
+	require.NoError(t, pq.Offer(context.Background(), req2))
+	restoredCtx2, gotReq2, _, ok2 := pq.Read(context.Background())
+	require.True(t, ok2)
+	assert.Equal(t, req2, gotReq2)
+	restoredSC2 := trace.SpanContextFromContext(restoredCtx2)
+	assert.False(t, restoredSC2.IsValid())
+}
+
+// ptraceTracesEncoding implements Encoding for ptrace.Traces using ProtoMarshaler/ProtoUnmarshaler.
+type ptraceTracesEncoding struct {
+	marshaler   *ptrace.ProtoMarshaler
+	unmarshaler *ptrace.ProtoUnmarshaler
+}
+
+func (e ptraceTracesEncoding) Marshal(val ptrace.Traces) ([]byte, error) {
+	return e.marshaler.MarshalTraces(val)
+}
+
+func (e ptraceTracesEncoding) Unmarshal(buf []byte) (ptrace.Traces, error) {
+	return e.unmarshaler.UnmarshalTraces(buf)
+}
+
+func BenchmarkPersistentQueue_PtraceTraces(b *testing.B) {
+	const (
+		spansPerRequest = 100
+		payloadSize     = 20 * 1024 // 20 KB per span attribute
+	)
+	// Prepare large Traces requests
+	req := ptrace.NewTraces()
+	rs := req.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("source", "benchmark")
+	ils := rs.ScopeSpans().AppendEmpty()
+	ils.Scope().SetName("benchscope")
+	for j := 0; j < spansPerRequest; j++ {
+		sp := ils.Spans().AppendEmpty()
+		sp.SetName("span-bench")
+		sp.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+		sp.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+		now := time.Now()
+		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now))
+		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Second)))
+		payload := make([]byte, payloadSize)
+		for k := range payload {
+			payload[k] = byte((j + k) % 256)
+		}
+		sp.Attributes().PutEmptyBytes("payload").FromRaw(payload)
+	}
+
+	// Use a persistent queue with large capacity
+	pq := newPersistentQueue[ptrace.Traces](persistentQueueSettings[ptrace.Traces]{
+		sizer:     request.RequestsSizer[ptrace.Traces]{},
+		capacity:  int64(b.N),
+		signal:    pipeline.SignalTraces,
+		storageID: component.ID{},
+		encoding:  ptraceTracesEncoding{marshaler: &ptrace.ProtoMarshaler{}, unmarshaler: &ptrace.ProtoUnmarshaler{}},
+		id:        component.NewID(exportertest.NopType),
+		telemetry: componenttest.NewNopTelemetrySettings(),
+	}).(*persistentQueue[ptrace.Traces])
+
+	// Set up real file-backed storage extension for the benchmark
+	storageDir := b.TempDir()
+	ext := contribstoragetest.NewFileBackedStorageExtension(storageDir, storageDir)
+	defer func() {
+		if err := ext.Shutdown(context.Background()); err != nil {
+			b.Fatalf("failed to shutdown storage extension: %v", err)
+		}
+	}()
+
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+		SpanID:     trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18},
+		TraceFlags: trace.TraceFlags(0x1),
+		TraceState: trace.TraceState{},
+		Remote:     false,
+	})
+	sharedContext := trace.ContextWithSpanContext(context.Background(), sc)
+	require.NoError(b, pq.Start(sharedContext, hosttest.NewHost(map[component.ID]component.Component{{}: ext})))
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		require.NoError(b, pq.Offer(context.Background(), req))
+	}
+
+	for i := 0; i < b.N; i++ {
+		require.True(b, consume(pq, func(context.Context, ptrace.Traces) error { return nil }))
+	}
+	require.NoError(b, ext.Shutdown(context.Background()))
+
+	if pq.Size() != 0 {
+		b.Fatalf("Queue not empty after all operations: size=%d", pq.Size())
+	}
+}
+
+func TestMarshalUnmarshalRequestWithSpanContext(t *testing.T) {
+	t.Run("valid SpanContext round-trip", func(t *testing.T) {
+		traceID, _ := trace.TraceIDFromHex("0102030405060708090a0b0c0d0e0f10")
+		spanID, _ := trace.SpanIDFromHex("0102030405060708")
+		sc := trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    traceID,
+			SpanID:     spanID,
+			TraceFlags: 0x01,
+			TraceState: trace.TraceState{},
+			Remote:     true,
+		})
+		ctxWithSC := trace.ContextWithSpanContext(context.Background(), sc)
+		request := uint64(42)
+		data, err := marshalRequestWithSpanContext(ctxWithSC, uint64Encoding{}, request)
+		require.NoError(t, err)
+		gotReq, gotCtx, err := unmarshalRequestWithSpanContext(uint64Encoding{}, data)
+		require.NoError(t, err)
+		assert.Equal(t, request, gotReq)
+		restoredSC := trace.SpanContextFromContext(gotCtx)
+		assert.True(t, restoredSC.IsValid())
+		assert.Equal(t, sc.TraceID(), restoredSC.TraceID())
+		assert.Equal(t, sc.SpanID(), restoredSC.SpanID())
+		assert.Equal(t, sc.TraceFlags(), restoredSC.TraceFlags())
+		assert.Equal(t, sc.TraceState().String(), restoredSC.TraceState().String())
+		assert.Equal(t, sc.IsRemote(), restoredSC.IsRemote())
+	})
+
+	t.Run("invalid SpanContext is omitted", func(t *testing.T) {
+		// An invalid SpanContext (zero value)
+		ctxWithInvalidSC := trace.ContextWithSpanContext(context.Background(), trace.SpanContext{})
+		request := uint64(99)
+		data, err := marshalRequestWithSpanContext(ctxWithInvalidSC, uint64Encoding{}, request)
+		require.NoError(t, err)
+		// Should not contain span_context field
+		assert.NotContains(t, string(data), "span_context")
+		gotReq, gotCtx, err := unmarshalRequestWithSpanContext(uint64Encoding{}, data)
+		require.NoError(t, err)
+		assert.Equal(t, request, gotReq)
+		restoredSC := trace.SpanContextFromContext(gotCtx)
+		assert.False(t, restoredSC.IsValid())
+	})
+
+	t.Run("no SpanContext in context is omitted", func(t *testing.T) {
+		request := uint64(123)
+		data, err := marshalRequestWithSpanContext(context.Background(), uint64Encoding{}, request)
+		require.NoError(t, err)
+		assert.NotContains(t, string(data), "span_context")
+		gotReq, gotCtx, err := unmarshalRequestWithSpanContext(uint64Encoding{}, data)
+		require.NoError(t, err)
+		assert.Equal(t, request, gotReq)
+		restoredSC := trace.SpanContextFromContext(gotCtx)
+		assert.False(t, restoredSC.IsValid())
+	})
+
+	t.Run("corrupted span_context field", func(t *testing.T) {
+		// Manually create a bad envelope using the new binary format
+		requestBytes := []byte{0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		badSpanContext := []byte(`{"TraceID":123}`) // invalid TraceID
+		buf := make([]byte, 0, 8+len(requestBytes)+len(badSpanContext))
+		//nolint:gosec // G115: integer overflow conversion int -> uint32
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(requestBytes)))
+		buf = append(buf, requestBytes...)
+		//nolint:gosec // G115: integer overflow conversion int -> uint32
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(badSpanContext)))
+		buf = append(buf, badSpanContext...)
+		_, gotCtx, err := unmarshalRequestWithSpanContext(uint64Encoding{}, buf)
+		require.NoError(t, err)
+		// Should not panic, should return background context
+		restoredSC := trace.SpanContextFromContext(gotCtx)
+		assert.False(t, restoredSC.IsValid())
+	})
+
+	t.Run("valid binary, invalid RequestBytes returns error", func(t *testing.T) {
+		requestBytes := []byte{0x01, 0x02} // too short for uint64Encoding.Unmarshal
+		badSpanContext := []byte{}
+		buf := make([]byte, 0, 8+len(requestBytes)+len(badSpanContext))
+		//nolint:gosec // G115: integer overflow conversion int -> uint32
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(requestBytes)))
+		buf = append(buf, requestBytes...)
+		//nolint:gosec // G115: integer overflow conversion int -> uint32
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(badSpanContext)))
+		buf = append(buf, badSpanContext...)
+		_, _, err := unmarshalRequestWithSpanContext(uint64Encoding{}, buf)
+		require.Error(t, err)
+	})
+}
+
+type errorEncoding struct{}
+
+func (errorEncoding) Marshal(_ uint64) ([]byte, error) {
+	return nil, errors.New("marshal error")
+}
+
+func (errorEncoding) Unmarshal(_ []byte) (uint64, error) {
+	return 0, nil
+}
+
+func TestMarshalRequestWithSpanContext_MarshalError(t *testing.T) {
+	ctx := context.Background()
+	_, err := marshalRequestWithSpanContext(ctx, errorEncoding{}, uint64(123))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "marshal error")
 }
