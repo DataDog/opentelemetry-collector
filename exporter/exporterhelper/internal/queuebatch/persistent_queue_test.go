@@ -1405,39 +1405,34 @@ func (e ptraceTracesEncoding) Unmarshal(buf []byte) (ptrace.Traces, error) {
 
 func BenchmarkPersistentQueue_PtraceTraces(b *testing.B) {
 	const (
-		numRequests     = 1000 // Fewer, as Traces can be large
 		spansPerRequest = 100
 		payloadSize     = 20 * 1024 // 20 KB per span attribute
 	)
 	// Prepare large Traces requests
-	requests := make([]ptrace.Traces, numRequests)
-	for i := range requests {
-		traces := ptrace.NewTraces()
-		rs := traces.ResourceSpans().AppendEmpty()
-		rs.Resource().Attributes().PutStr("source", "benchmark")
-		ils := rs.ScopeSpans().AppendEmpty()
-		ils.Scope().SetName("benchscope")
-		for j := 0; j < spansPerRequest; j++ {
-			sp := ils.Spans().AppendEmpty()
-			sp.SetName("span-bench")
-			sp.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-			sp.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
-			now := time.Now()
-			sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now))
-			sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Second)))
-			payload := make([]byte, payloadSize)
-			for k := range payload {
-				payload[k] = byte((i + j + k) % 256)
-			}
-			sp.Attributes().PutEmptyBytes("payload").FromRaw(payload)
+	req := ptrace.NewTraces()
+	rs := req.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("source", "benchmark")
+	ils := rs.ScopeSpans().AppendEmpty()
+	ils.Scope().SetName("benchscope")
+	for j := 0; j < spansPerRequest; j++ {
+		sp := ils.Spans().AppendEmpty()
+		sp.SetName("span-bench")
+		sp.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+		sp.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+		now := time.Now()
+		sp.SetStartTimestamp(pcommon.NewTimestampFromTime(now))
+		sp.SetEndTimestamp(pcommon.NewTimestampFromTime(now.Add(time.Second)))
+		payload := make([]byte, payloadSize)
+		for k := range payload {
+			payload[k] = byte((j + k) % 256)
 		}
-		requests[i] = traces
+		sp.Attributes().PutEmptyBytes("payload").FromRaw(payload)
 	}
 
 	// Use a persistent queue with large capacity
 	pq := newPersistentQueue[ptrace.Traces](persistentQueueSettings[ptrace.Traces]{
 		sizer:     request.RequestsSizer[ptrace.Traces]{},
-		capacity:  int64(numRequests),
+		capacity:  int64(b.N),
 		signal:    pipeline.SignalTraces,
 		storageID: component.ID{},
 		encoding:  ptraceTracesEncoding{marshaler: &ptrace.ProtoMarshaler{}, unmarshaler: &ptrace.ProtoUnmarshaler{}},
@@ -1454,47 +1449,29 @@ func BenchmarkPersistentQueue_PtraceTraces(b *testing.B) {
 		}
 	}()
 
-	client, err := ext.GetClient(context.Background(), component.KindExporter, pq.set.id, pq.set.signal.String())
-	if err != nil {
-		b.Fatalf("failed to get storage client: %v", err)
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+		SpanID:     trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18},
+		TraceFlags: trace.TraceFlags(0x1),
+		TraceState: trace.TraceState{},
+		Remote:     false,
+	})
+	sharedContext := trace.ContextWithSpanContext(context.Background(), sc)
+	require.NoError(b, pq.Start(sharedContext, hosttest.NewHost(map[component.ID]component.Component{{}: ext})))
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		require.NoError(b, pq.Offer(context.Background(), req))
 	}
 
-	b.Run("BenchmarkWithPTraceEncoding", func(b *testing.B) {
-		sc := trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    trace.TraceID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
-			SpanID:     trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18},
-			TraceFlags: trace.TraceFlags(0x1),
-			TraceState: trace.TraceState{},
-			Remote:     false,
-		})
-		sharedContext := trace.ContextWithSpanContext(context.Background(), sc)
-		pq.initClient(sharedContext, client)
+	for i := 0; i < b.N; i++ {
+		require.True(b, consume(pq, func(context.Context, ptrace.Traces) error { return nil }))
+	}
+	require.NoError(b, ext.Shutdown(context.Background()))
 
-		b.ResetTimer()
-		b.ReportAllocs()
-
-		// Offer all requests
-		for i := 0; i < numRequests; i++ {
-			err := pq.Offer(sharedContext, requests[i])
-			if err != nil {
-				b.Fatalf("Offer failed at %d: %v", i, err)
-			}
-		}
-
-		// Read and OnDone all requests
-		for i := 0; i < numRequests; i++ {
-			_, req, done, ok := pq.Read(sharedContext)
-			if !ok {
-				b.Fatalf("Read failed at %d", i)
-			}
-			if req.SpanCount() != spansPerRequest {
-				b.Fatalf("SpanCount mismatch at %d: got %d", i, req.SpanCount())
-			}
-			done.OnDone(nil)
-		}
-
-		if pq.Size() != 0 {
-			b.Fatalf("Queue not empty after all operations: size=%d", pq.Size())
-		}
-	})
+	if pq.Size() != 0 {
+		b.Fatalf("Queue not empty after all operations: size=%d", pq.Size())
+	}
 }
