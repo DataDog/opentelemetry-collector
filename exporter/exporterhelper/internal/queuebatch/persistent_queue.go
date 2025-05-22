@@ -6,8 +6,6 @@ package queuebatch // import "go.opentelemetry.io/collector/exporter/exporterhel
 import (
 	"context"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -16,11 +14,15 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"encoding/hex"
+
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/experr"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pipeline"
 )
 
@@ -33,8 +35,6 @@ const (
 	writeIndexKey               = "wi"
 	currentlyDispatchedItemsKey = "di"
 	queueSizeKey                = "si"
-
-	errInvalidTraceFlagsLength = "trace flags must only be 1 byte"
 )
 
 var (
@@ -253,80 +253,6 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 	return pq.putInternal(ctx, req)
 }
 
-// necessary due to SpanContext and SpanContextConfig not supporting Unmarshal interface,
-// see https://github.com/open-telemetry/opentelemetry-go/issues/1819.
-type spanContext struct {
-	TraceID    string
-	SpanID     string
-	TraceFlags string
-	TraceState string
-	Remote     bool
-}
-
-func localSpanContextFromTraceSpanContext(sc trace.SpanContext) spanContext {
-	return spanContext{
-		TraceID:    sc.TraceID().String(),
-		SpanID:     sc.SpanID().String(),
-		TraceFlags: sc.TraceFlags().String(),
-		TraceState: sc.TraceState().String(),
-		Remote:     sc.IsRemote(),
-	}
-}
-
-func contextWithLocalSpanContext(ctx context.Context, sc spanContext) context.Context {
-	traceID, err := trace.TraceIDFromHex(sc.TraceID)
-	if err != nil {
-		return ctx
-	}
-	spanID, err := trace.SpanIDFromHex(sc.SpanID)
-	if err != nil {
-		return ctx
-	}
-	traceFlags, err := traceFlagsFromHex(sc.TraceFlags)
-	if err != nil {
-		return ctx
-	}
-	traceState, err := trace.ParseTraceState(sc.TraceState)
-	if err != nil {
-		return ctx
-	}
-
-	return trace.ContextWithSpanContext(ctx, trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    traceID,
-		SpanID:     spanID,
-		TraceFlags: *traceFlags,
-		TraceState: traceState,
-		Remote:     sc.Remote,
-	}))
-}
-
-// requestContext wraps trace.SpanContext to allow for unmarshaling as well as
-// future metadata key/value pairs to be added.
-type requestContext struct {
-	SpanContext spanContext
-}
-
-// reverse of code in trace library https://github.com/open-telemetry/opentelemetry-go/blob/v1.35.0/trace/trace.go#L143-L168
-func traceFlagsFromHex(hexStr string) (*trace.TraceFlags, error) {
-	decoded, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return nil, err
-	}
-	if len(decoded) != 1 {
-		return nil, errors.New(errInvalidTraceFlagsLength)
-	}
-	traceFlags := trace.TraceFlags(decoded[0])
-	return &traceFlags, nil
-}
-
-func getAndMarshalSpanContext(ctx context.Context) ([]byte, error) {
-	if !persistRequestContextFeatureGate.IsEnabled() {
-		return nil, nil
-	}
-	rc := localSpanContextFromTraceSpanContext(trace.SpanContextFromContext(ctx))
-	return json.Marshal(requestContext{SpanContext: rc})
-}
-
 // putInternal is the internal version that requires caller to hold the mutex lock.
 func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
 	reqSize := pq.set.sizer.Sizeof(req)
@@ -349,7 +275,7 @@ func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
 	ops[1] = storage.SetOperation(getItemKey(pq.writeIndex), reqBuf)
 
 	if persistRequestContextFeatureGate.IsEnabled() {
-		contextBuf, scErr := getAndMarshalSpanContext(ctx)
+		contextBuf, scErr := marshalSpanContextProto(ctx)
 		if scErr != nil {
 			return scErr
 		}
@@ -447,13 +373,11 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, bool,
 
 	// Only try to restore context if feature gate is enabled
 	if persistRequestContextFeatureGate.IsEnabled() {
-		var rc requestContext
 		if ctxOp.Value != nil {
-			unmarshalErr := json.Unmarshal(ctxOp.Value, &rc)
-			if unmarshalErr != nil {
-				return 0, request, false, ctx, unmarshalErr
+			restoredContext, err = unmarshalSpanContextProto(ctxOp.Value)
+			if err != nil {
+				return 0, request, false, ctx, err
 			}
-			restoredContext = contextWithLocalSpanContext(restoredContext, rc.SpanContext)
 		}
 	}
 
@@ -583,12 +507,9 @@ func (pq *persistentQueue[T]) retrieveAndEnqueueNotDispatchedReqs(ctx context.Co
 		if persistRequestContextFeatureGate.IsEnabled() {
 			ctxOp := retrieveBatch[idx+len(dispatchedItems)]
 			if ctxOp.Value != nil {
-				var rc requestContext
-				unmarshalErr := json.Unmarshal(ctxOp.Value, &rc)
-				if unmarshalErr == nil {
-					restoredContext = contextWithLocalSpanContext(restoredContext, rc.SpanContext)
-				} else {
-					pq.logger.Warn("Failed retrieving request context, storing empty span context", zap.String(zapKey, ctxOp.Key), zap.Error(unmarshalErr))
+				restoredContext, err = unmarshalSpanContextProto(ctxOp.Value)
+				if err != nil {
+					pq.logger.Warn("Failed retrieving request context, storing empty span context", zap.String(zapKey, ctxOp.Key), zap.Error(err))
 				}
 			}
 		}
@@ -737,4 +658,80 @@ func (id *indexDone) reset(index uint64, size int64, queue interface{ onDone(uin
 
 func (id *indexDone) OnDone(err error) {
 	id.queue.onDone(id.index, id.size, err)
+}
+
+func marshalSpanContextProto(ctx context.Context) ([]byte, error) {
+	if !persistRequestContextFeatureGate.IsEnabled() {
+		return nil, nil
+	}
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return nil, nil
+	}
+	span := ptrace.NewSpan()
+	// Set context fields
+	traceIDBytes, _ := hex.DecodeString(sc.TraceID().String())
+	var traceIDArr [16]byte
+	copy(traceIDArr[:], traceIDBytes)
+	span.SetTraceID(pcommon.TraceID(traceIDArr))
+	spanIDBytes, _ := hex.DecodeString(sc.SpanID().String())
+	var spanIDArr [8]byte
+	copy(spanIDArr[:], spanIDBytes)
+	span.SetSpanID(pcommon.SpanID(spanIDArr))
+	span.SetFlags(uint32(sc.TraceFlags()))
+	span.TraceState().FromRaw(sc.TraceState().String())
+	// Store IsRemote as an attribute (since ptrace.Span has no explicit Remote field)
+	span.Attributes().PutBool("remote", sc.IsRemote())
+
+	traces := ptrace.NewTraces()
+	rs := traces.ResourceSpans().AppendEmpty()
+	scspans := rs.ScopeSpans().AppendEmpty()
+	span.CopyTo(scspans.Spans().AppendEmpty())
+
+	marshaler := &ptrace.ProtoMarshaler{}
+	return marshaler.MarshalTraces(traces)
+}
+
+func unmarshalSpanContextProto(data []byte) (context.Context, error) {
+	if len(data) == 0 {
+		return context.Background(), nil
+	}
+	unmarshaler := &ptrace.ProtoUnmarshaler{}
+	traces, err := unmarshaler.UnmarshalTraces(data)
+	if err != nil {
+		return context.Background(), err
+	}
+	if traces.ResourceSpans().Len() == 0 {
+		return context.Background(), nil
+	}
+	rs := traces.ResourceSpans().At(0)
+	if rs.ScopeSpans().Len() == 0 {
+		return context.Background(), nil
+	}
+	scopeSpans := rs.ScopeSpans().At(0)
+	if scopeSpans.Spans().Len() == 0 {
+		return context.Background(), nil
+	}
+	span := scopeSpans.Spans().At(0)
+	// Use addressable array for hex.EncodeToString
+	traceID := span.TraceID()
+	spanID := span.SpanID()
+	traceIDHex := hex.EncodeToString(traceID[:])
+	spanIDHex := hex.EncodeToString(spanID[:])
+	flags := trace.TraceFlags(span.Flags())
+	traceState, _ := trace.ParseTraceState(span.TraceState().AsRaw())
+	remote := false
+	if v, ok := span.Attributes().Get("remote"); ok {
+		remote = v.Bool()
+	}
+	tsc, _ := trace.TraceIDFromHex(traceIDHex)
+	ssc, _ := trace.SpanIDFromHex(spanIDHex)
+	sctx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    tsc,
+		SpanID:     ssc,
+		TraceFlags: flags,
+		TraceState: traceState,
+		Remote:     remote,
+	})
+	return trace.ContextWithSpanContext(context.Background(), sctx), nil
 }

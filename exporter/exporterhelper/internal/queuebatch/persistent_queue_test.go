@@ -6,7 +6,6 @@ package queuebatch
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -31,6 +30,7 @@ import (
 	"go.opentelemetry.io/collector/extension/extensiontest"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pipeline"
 )
 
@@ -1044,7 +1044,7 @@ func TestPersistentQueue_StorageFull(t *testing.T) {
 			lenMarshaled := len(marshaled)
 			if tc.featureEnabled {
 				ctx := trace.ContextWithSpanContext(context.Background(), tc.spanContext)
-				m, marshalErr := getAndMarshalSpanContext(ctx)
+				m, marshalErr := marshalSpanContextProto(ctx)
 				require.NoError(t, marshalErr)
 				lenMarshaled += len(m)
 			}
@@ -1341,71 +1341,6 @@ func requireCurrentlyDispatchedItemsEqual(t *testing.T, pq *persistentQueue[uint
 	assert.ElementsMatch(t, compare, pq.currentlyDispatchedItems)
 }
 
-func TestSpanContextFromContextAndBack(t *testing.T) {
-	tid := trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	sid := trace.SpanID{1, 2, 3, 4, 5, 6, 7, 8}
-	flags := trace.FlagsSampled
-	state, _ := trace.ParseTraceState("foo=bar,baz=qux")
-	remote := true
-
-	sc := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    tid,
-		SpanID:     sid,
-		TraceFlags: flags,
-		TraceState: state,
-		Remote:     remote,
-	})
-	ctx := trace.ContextWithSpanContext(context.Background(), sc)
-
-	// Test spanContextFromContext
-	local := localSpanContextFromTraceSpanContext(trace.SpanContextFromContext(ctx))
-	assert.Equal(t, tid.String(), local.TraceID)
-	assert.Equal(t, sid.String(), local.SpanID)
-	assert.Equal(t, flags.String(), local.TraceFlags)
-	assert.Equal(t, state.String(), local.TraceState)
-	assert.Equal(t, remote, local.Remote)
-
-	// Test contextWithLocalSpanContext
-	ctx2 := contextWithLocalSpanContext(context.Background(), local)
-	sc2 := trace.SpanContextFromContext(ctx2)
-	assert.Equal(t, tid, sc2.TraceID())
-	assert.Equal(t, sid, sc2.SpanID())
-	assert.Equal(t, flags, sc2.TraceFlags())
-	assert.Equal(t, state, sc2.TraceState())
-	assert.Equal(t, remote, sc2.IsRemote())
-}
-
-func TestLocalSpanContextFromTraceSpanContext(t *testing.T) {
-	sc := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    trace.TraceID{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00},
-		SpanID:     trace.SpanID{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88},
-		TraceFlags: trace.FlagsSampled,
-		TraceState: trace.TraceState{},
-		Remote:     false,
-	})
-	local := localSpanContextFromTraceSpanContext(sc)
-	assert.Equal(t, sc.TraceID().String(), local.TraceID)
-	assert.Equal(t, sc.SpanID().String(), local.SpanID)
-	assert.Equal(t, sc.TraceFlags().String(), local.TraceFlags)
-	assert.Equal(t, sc.TraceState().String(), local.TraceState)
-	assert.Equal(t, sc.IsRemote(), local.Remote)
-}
-
-func TestContextWithLocalSpanContext_InvalidHex(t *testing.T) {
-	ctx := context.Background()
-	bad := spanContext{
-		TraceID:    "nothex",
-		SpanID:     "nothex",
-		TraceFlags: "nothex",
-		TraceState: "invalid=state",
-		Remote:     false,
-	}
-	ctx2 := contextWithLocalSpanContext(ctx, bad)
-	// Should return the original context (no span context injected)
-	sc := trace.SpanContextFromContext(ctx2)
-	assert.False(t, sc.IsValid())
-}
-
 func TestPersistentQueue_SpanContextRoundTrip(t *testing.T) {
 	require.NoError(t, featuregate.GlobalRegistry().Set("exporter.PersistRequestContext", true))
 	defer func() {
@@ -1463,53 +1398,6 @@ func TestPersistentQueue_SpanContextRoundTrip(t *testing.T) {
 	assert.Equal(t, req2, gotReq2)
 	restoredSC2 := trace.SpanContextFromContext(restoredCtx2)
 	assert.False(t, restoredSC2.IsValid())
-}
-
-func TestSpanContextUnmarshalJSON(t *testing.T) {
-	testCases := []struct {
-		name          string
-		expectNil     bool
-		expectErr     bool
-		marshaledData []byte
-	}{
-		{
-			name:          "Invalid JSON data",
-			expectNil:     true,
-			expectErr:     true,
-			marshaledData: []byte(`{"invalid json}`),
-		},
-		{
-			name:          "Valid JSON but not valid spanContext",
-			expectNil:     true,
-			expectErr:     false,
-			marshaledData: []byte(`{"foo":"bar"}`),
-		},
-		{
-			name:          "Valid JSON with spanContext fields but invalid SC",
-			expectNil:     true,
-			expectErr:     false,
-			marshaledData: []byte(`{"TraceID": "00000000000000000000000000000000","SpanID":"00000000000000000","TraceFlags":"0","TraceState":"0","Remote":false}`),
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			var rc requestContext
-			err := json.Unmarshal(tc.marshaledData, &rc)
-			if tc.expectErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			if tc.expectNil {
-				require.Empty(t, rc.SpanContext.TraceID)
-				require.Empty(t, rc.SpanContext.SpanID)
-				require.Empty(t, rc.SpanContext.TraceFlags)
-				require.Empty(t, rc.SpanContext.TraceState)
-				require.False(t, rc.SpanContext.Remote)
-			}
-		})
-	}
 }
 
 func TestPersistentQueue_PutInternal_FailingEncoding(t *testing.T) {
@@ -1989,92 +1877,6 @@ func TestPersistentQueue_RetrieveAndEnqueueNotDispatchedReqs_ContextUnmarshalFai
 	require.False(t, restoredSC.IsValid(), "restored context should not have a valid span context if context unmarshal fails")
 }
 
-func TestTraceFlagsFromHex(t *testing.T) {
-	// Valid 1-byte hex string
-	flags, err := traceFlagsFromHex("01")
-	require.NoError(t, err)
-	require.NotNil(t, flags)
-	require.Equal(t, trace.TraceFlags(1), *flags)
-
-	// Invalid hex string (should error from hex.DecodeString)
-	_, err = traceFlagsFromHex("zz")
-	require.Error(t, err)
-
-	// Valid hex but wrong length (should error on len(decoded) != 1)
-	_, err = traceFlagsFromHex("0102")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), errInvalidTraceFlagsLength)
-}
-
-func TestContextWithLocalSpanContext_AllBranches(t *testing.T) {
-	// Valid case
-	tid := "0102030405060708090a0b0c0d0e0f10"
-	sid := "0102030405060708"
-	flags := "01"
-	state := "foo=bar"
-	sc := spanContext{
-		TraceID:    tid,
-		SpanID:     sid,
-		TraceFlags: flags,
-		TraceState: state,
-		Remote:     true,
-	}
-	ctx := contextWithLocalSpanContext(context.Background(), sc)
-	span := trace.SpanContextFromContext(ctx)
-	require.True(t, span.IsValid())
-	require.Equal(t, tid, span.TraceID().String())
-	require.Equal(t, sid, span.SpanID().String())
-	require.Equal(t, trace.TraceFlags(1), span.TraceFlags())
-	require.Equal(t, state, span.TraceState().String())
-	require.True(t, span.IsRemote())
-
-	// Invalid TraceID
-	scBadTraceID := sc
-	scBadTraceID.TraceID = "nothex"
-	ctx = contextWithLocalSpanContext(context.Background(), scBadTraceID)
-	span = trace.SpanContextFromContext(ctx)
-	require.False(t, span.IsValid())
-
-	// Invalid SpanID
-	scBadSpanID := sc
-	scBadSpanID.SpanID = "nothex"
-	ctx = contextWithLocalSpanContext(context.Background(), scBadSpanID)
-	span = trace.SpanContextFromContext(ctx)
-	require.False(t, span.IsValid())
-
-	// Invalid TraceFlags (not hex)
-	scBadFlags := sc
-	scBadFlags.TraceFlags = "zz"
-	ctx = contextWithLocalSpanContext(context.Background(), scBadFlags)
-	span = trace.SpanContextFromContext(ctx)
-	require.False(t, span.IsValid())
-
-	// Invalid TraceFlags (wrong length)
-	scBadFlagsLen := sc
-	scBadFlagsLen.TraceFlags = "0102"
-	ctx = contextWithLocalSpanContext(context.Background(), scBadFlagsLen)
-	span = trace.SpanContextFromContext(ctx)
-	require.False(t, span.IsValid())
-
-	// Invalid TraceState
-	scBadState := sc
-	scBadState.TraceState = "bad=tracestate,=bad"
-	ctx = contextWithLocalSpanContext(context.Background(), scBadState)
-	span = trace.SpanContextFromContext(ctx)
-	require.False(t, span.IsValid())
-}
-
-func TestGetAndMarshalSpanContext_FeatureGateDisabled(t *testing.T) {
-	require.NoError(t, featuregate.GlobalRegistry().Set("exporter.PersistRequestContext", false))
-	defer func() {
-		require.NoError(t, featuregate.GlobalRegistry().Set("exporter.PersistRequestContext", true))
-	}()
-
-	data, err := getAndMarshalSpanContext(context.Background())
-	require.NoError(t, err)
-	require.Nil(t, data)
-}
-
 func TestPersistentQueue_Read_ItemDispatchingFinishError(t *testing.T) {
 	// This error will be returned by the fake client on the second Batch call (itemDispatchingFinish)
 	errItemFinish := errors.New("itemDispatchingFinish error")
@@ -2118,4 +1920,42 @@ func TestPersistentQueue_Read_ItemDispatchingFinishErrorPath(t *testing.T) {
 	}()
 
 	_, _, _, _ = pq.Read(context.Background()) // The error is only logged, not returned, so we can't assert on output
+}
+func TestUnmarshalSpanContextProto_EarlyReturns(t *testing.T) {
+	// Helper to marshal a ptrace.Traces with a specific structure
+	marshal := func(modify func(tracesPtr interface{})) []byte {
+		traces := ptrace.NewTraces()
+		modify(&traces)
+		marshaler := &ptrace.ProtoMarshaler{}
+		data, err := marshaler.MarshalTraces(traces)
+		require.NoError(t, err)
+		return data
+	}
+
+	// Case 1: traces.ResourceSpans().Len() == 0
+	data1 := marshal(func(tracesPtr interface{}) {
+		// do nothing, leave ResourceSpans empty
+	})
+	ctx, err := unmarshalSpanContextProto(data1)
+	assert.NoError(t, err)
+	assert.Equal(t, context.Background(), ctx)
+
+	// Case 2: rs.ScopeSpans().Len() == 0
+	data2 := marshal(func(tracesPtr interface{}) {
+		traces := tracesPtr.(*ptrace.Traces)
+		traces.ResourceSpans().AppendEmpty() // add one ResourceSpans, but no ScopeSpans
+	})
+	ctx, err = unmarshalSpanContextProto(data2)
+	assert.NoError(t, err)
+	assert.Equal(t, context.Background(), ctx)
+
+	// Case 3: scopeSpans.Spans().Len() == 0
+	data3 := marshal(func(tracesPtr interface{}) {
+		traces := tracesPtr.(*ptrace.Traces)
+		rs := traces.ResourceSpans().AppendEmpty()
+		rs.ScopeSpans().AppendEmpty() // add one ScopeSpans, but no Spans
+	})
+	ctx, err = unmarshalSpanContextProto(data3)
+	assert.NoError(t, err)
+	assert.Equal(t, context.Background(), ctx)
 }
