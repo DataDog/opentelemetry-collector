@@ -7,6 +7,39 @@ If you are looking for developer-facing changes, check out [CHANGELOG-API.md](./
 
 <!-- next version -->
 
+## v1.34.1/v0.128.1
+
+### 🛑 Breaking changes 🛑
+
+- `semconv`: Removing deprecated semconv package (#13071)
+- `exporterhelper`: Remove deprecated sending_queue::blocking options, use sending_queue::block_on_overflow. (#13211)
+
+### 💡 Enhancements 💡
+
+- `service`: Support setting `sampler` and `limits` under `service::telemetry::traces` (#13201)
+  This allows users to enable sampling and set span limits on internal Collector traces using the
+  OpenTelemetry SDK declarative configuration.
+  
+- `pdata/pprofile`: Add new helper methods `FromLocationIndices` and `PutLocation` to read and modify the content of locations. (#13150)
+- `exporterhelper`: Preserve request span context and client metadata in the persistent queue. (#11740, #13220)
+  It allows internal collector spans and client metadata to propagate through the persistent queue used by 
+  the exporters. The same way as it's done for the in-memory queue.
+  Currently, it is behind the exporter.PersistRequestContext feature gate, which can be enabled by adding 
+  `--feature-gates=exporter.PersistRequestContext` to the collector command line. An exporter buffer stored by
+  a previous version of the collector (or by a collector with the feature gate disabled) can be read by a newer
+  collector with the feature enabled. However, the reverse is not supported: a buffer stored by a newer collector with
+  the feature enabled cannot be read by an older collector (or by a collector with the feature gate disabled).
+  
+
+### 🧰 Bug fixes 🧰
+
+- `service`: Only allocate one set of internal log sampling counters (#13014)
+  The case where logs are only exported to stdout was fixed in v0.126.0;
+  this new fix also covers the case where logs are exported through OTLP.
+  
+
+<!-- previous-version -->
+
 ## v1.34.0/v0.128.0
 
 ### 🛑 Breaking changes 🛑
