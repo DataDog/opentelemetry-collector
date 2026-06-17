@@ -223,10 +223,10 @@ jobs:
           key: coverage-${{ runner.os }}-go-build-${{ hashFiles('**/go.sum') }}
       - name: Run Unit Tests With Coverage
         run: make gotest-with-cover
-      - name: Upload coverage report
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # 5.4.3
+      - name: Upload coverage to Datadog
         env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: npx --yes @datadog/datadog-ci coverage upload --service opentelemetry-collector coverage.txt
 
   cross-build-collector:
     needs: [setup-environment]
