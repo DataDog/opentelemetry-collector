@@ -224,6 +224,7 @@ jobs:
       - name: Run Unit Tests With Coverage
         run: make gotest-with-cover
       - name: Upload coverage to Datadog
+        continue-on-error: true
         env:
           DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
         run: npx --yes @datadog/datadog-ci coverage upload coverage.txt
