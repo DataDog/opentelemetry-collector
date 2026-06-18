@@ -226,7 +226,7 @@ jobs:
       - name: Upload coverage to Datadog
         env:
           DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
-        run: npx --yes @datadog/datadog-ci coverage upload --service opentelemetry-collector coverage.txt
+        run: npx --yes @datadog/datadog-ci coverage upload coverage.txt
 
   cross-build-collector:
     needs: [setup-environment]
